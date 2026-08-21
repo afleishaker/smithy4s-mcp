@@ -3,7 +3,7 @@ package app
 import cats.effect.ExitCode
 import cats.effect.IO
 import cats.effect.IOApp
-import cats.syntax.all.*
+import cats.syntax.all._
 import fs2.io.process.Processes
 import mcptraits.McpClientApi
 import mcptraits.McpServerApi
@@ -20,14 +20,15 @@ object clientMain extends IOApp {
         .flatMap { proc =>
           interop
             .startClient(
-              new McpClientApi.Default[IO](IO.stub),
+              _ => new McpClientApi.Default[IO](IO.stub),
               proc,
             )
         }
         .onFinalize(printErr("Terminating client"))
-        .use { case given McpServerApi[IO] =>
+        .use { rawServer =>
+          implicit val server: McpServerApi[IO] = rawServer
 
-          McpServerApi[IO]
+          server
             .initialize(
               protocolVersion = "2025-11-25",
               capabilities = ClientCapabilities(),
@@ -37,7 +38,7 @@ object clientMain extends IOApp {
               printErr(
                 s"Initialized with: ${initResult.serverInfo.name} ${initResult.serverInfo.version}"
               ) *>
-                McpServerApi[IO].listTools().flatMap { tools =>
+                server.listTools().flatMap { tools =>
                   printErr(s"Available tools: ${tools.tools.map(_.name).mkString(", ")}")
                 } *>
                 useGithub(McpBuilder.remoteServerStub(GithubMcpServer))

@@ -2,14 +2,14 @@ package app
 
 import cats.effect.IO
 import cats.effect.Resource
-import cats.syntax.all.*
-import com.github.plokhotnyuk.jsoniter_scala.circe.JsoniterScalaCodec.*
-import com.github.plokhotnyuk.jsoniter_scala.core.*
+import cats.syntax.all._
+import com.github.plokhotnyuk.jsoniter_scala.circe.JsoniterScalaCodec._
+import com.github.plokhotnyuk.jsoniter_scala.core._
 import io.circe.Decoder
 import io.circe.Encoder
 import io.circe.HCursor
 import io.circe.Json
-import io.circe.syntax.*
+import io.circe.syntax._
 import jsonrpclib.CallId
 import jsonrpclib.InputMessage.NotificationMessage
 import jsonrpclib.InputMessage.RequestMessage
@@ -19,14 +19,14 @@ import jsonrpclib.Message
 import jsonrpclib.OutputMessage.ResponseMessage
 import jsonrpclib.Payload
 import jsonrpclib.ProtocolError
-import jsonrpclib.fs2.CancelTemplate
-import jsonrpclib.fs2.FS2Channel
-import jsonrpclib.fs2.given
+import jsonrpclib.fs2._
 import jsonrpclib.smithy4sinterop.CirceJsonCodec
 import jsonrpclib.smithy4sinterop.ClientStub
 import jsonrpclib.smithy4sinterop.ServerEndpoints
 import mcptraits.McpClientApi
+import mcptraits.McpClientApiGen
 import mcptraits.McpServerApi
+import mcptraits.McpServerApiGen
 import mcptraits.McpTool
 import modelcontextprotocol.CallToolResult
 import modelcontextprotocol.ClientCapabilities
@@ -63,7 +63,6 @@ import smithy4s.Service
 import smithy4s.ShapeId
 import smithy4s.kinds.FunctorAlgebra
 import smithy4s.schema.Alt
-import smithy4s.schema.Alt.Dispatcher
 import smithy4s.schema.CollectionTag
 import smithy4s.schema.EnumTag
 import smithy4s.schema.EnumTag.ClosedIntEnum
@@ -76,65 +75,65 @@ import smithy4s.schema.Schema.StructSchema
 import smithy4s.schema.Schema.UnionSchema
 import smithy4s.schema.SchemaVisitor
 import smithy4s.~>
-import util.chaining.*
 
 import scala.collection.immutable.ListMap
 
-import McpBuilder.internal.*
+import McpBuilder.internal._
 
 object McpBuilder {
 
   def server[Alg[_[_, _, _, _, _]]](
     impl: FunctorAlgebra[Alg, IO]
   )(
-    using service: Service[Alg]
+    implicit service: Service[Alg]
   ): McpServerApi[IO] =
-    new {
+    new McpServerApi[IO] {
       def ping(): IO[Unit] = IO.unit
 
       val allMyMonkeysCompiled: ListMap[String, CompiledTool] = {
         val fk = service.toPolyFunction(impl)
 
+        // Scala 2 skolemizes the wildcards of `service.endpoints` independently at each use site,
+        // so the endpoint's type parameters have to be opened by an explicitly parameterized
+        // method before `decodeIn`, `e.wrap` and `encodeOut` can be seen to line up.
+        def compileOne[I, E, O, SI, SO](e: service.Endpoint[I, E, O, SI, SO]): CompiledTool = {
+          val toolHint = e
+            .hints
+            .get[McpTool]
+            .getOrElse(
+              sys.error(s"Endpoint ${e.id} is not a tool, we can't compile it")
+            )
+
+          val decodeIn = Document.Decoder.fromSchema(e.input)
+          val encodeOut = Document.Encoder.fromSchema(e.output)
+
+          CompiledTool(
+            Tool(
+              name = toolName(toolHint, e),
+              inputSchema = deriveSchema(e.input),
+              outputSchema = Some(deriveSchema(e.output)),
+              annotations = Some(
+                ToolAnnotations(
+                  readOnlyHint = Some(e.hints.has[Readonly]),
+                  idempotentHint = Some(e.hints.has[smithy.api.Idempotent]),
+                )
+              ),
+            ),
+            impl = { doc =>
+              decodeIn
+                .decode(doc)
+                .liftTo[IO]
+                .map(i => e.wrap(i))
+                .flatMap(op => fk(op))
+                .map(o => encodeOut.encode(o))
+            },
+          )
+        }
+
         service
           .endpoints
           .filter(_.hints.has[McpTool])
-          .map { e =>
-            val toolHint = e
-              .hints
-              .get[McpTool]
-              .getOrElse(
-                sys.error(s"Endpoint ${e.id} is not a tool, we can't compile it")
-              )
-
-            val decodeIn = Document.Decoder.fromSchema(e.input)
-            val encodeOut = Document.Encoder.fromSchema(e.output)
-
-            CompiledTool(
-              Tool(
-                name = toolName(toolHint, e),
-                inputSchema = deriveSchema(
-                  using e.input
-                ),
-                outputSchema = Some(
-                  deriveSchema(
-                    using e.output
-                  )
-                ),
-                annotations = Some(
-                  ToolAnnotations(
-                    readOnlyHint = Some(e.hints.has[Readonly]),
-                    idempotentHint = Some(e.hints.has[smithy.api.Idempotent]),
-                  )
-                ),
-              ),
-              impl =
-                _.pipe(decodeIn.decode)
-                  .liftTo[IO]
-                  .map(e.wrap)
-                  .flatMap(fk(_))
-                  .map(encodeOut.encode),
-            )
-          }
+          .map(e => compileOne(e))
           .map(ct => ct.tool.name -> ct)
           .to(ListMap)
       }
@@ -196,42 +195,40 @@ object McpBuilder {
       impl: Document => IO[Document],
     )
 
-    enum JsonSchema {
-      case ObjectSchema(properties: Map[String, JsonSchema], required: List[String])
-      case AnyOfSchema(options: List[JsonSchema])
-      case NumberSchema
-      case StringSchema
-      case ListSchema(itemSchema: JsonSchema)
-      case EnumSchema(options: List[String])
-      case IntEnumSchema(options: List[Int])
+    /** Const type constructor: stands in for Scala 3's `[_] =>> JsonSchema`, so that
+      * `SchemaVisitor` can be instantiated at a type that ignores the schema's type parameter.
+      */
+    type ConstSchema[A] = JsonSchema
+
+    sealed trait JsonSchema {
 
       def asDocument: Document =
         this match {
-          case ObjectSchema(properties, required) =>
+          case JsonSchema.ObjectSchema(properties, required) =>
             Document.obj(
               "type" -> Document.fromString("object"),
               "properties" -> Document.obj(
-                properties.map(_ -> _.asDocument).toSeq
+                properties.map { case (k, v) => k -> v.asDocument }.toSeq
               ),
               "required" -> Document.array(required.map(Document.fromString)),
             )
-          case NumberSchema         => Document.obj("type" -> Document.fromString("number"))
-          case StringSchema         => Document.obj("type" -> Document.fromString("string"))
-          case AnyOfSchema(options) =>
+          case JsonSchema.NumberSchema         => Document.obj("type" -> Document.fromString("number"))
+          case JsonSchema.StringSchema         => Document.obj("type" -> Document.fromString("string"))
+          case JsonSchema.AnyOfSchema(options) =>
             Document.obj(
               "anyOf" -> Document.array(options.map(_.asDocument))
             )
-          case ListSchema(itemSchema) =>
+          case JsonSchema.ListSchema(itemSchema) =>
             Document.obj(
               "type" -> Document.fromString("array"),
               "items" -> itemSchema.asDocument,
             )
-          case EnumSchema(options) =>
+          case JsonSchema.EnumSchema(options) =>
             Document.obj(
               "type" -> Document.fromString("string"),
               "enum" -> Document.array(options.map(Document.fromString)),
             )
-          case IntEnumSchema(options) =>
+          case JsonSchema.IntEnumSchema(options) =>
             Document.obj(
               "type" -> Document.fromString("integer"),
               "enum" -> Document.array(options.map(Document.fromInt)),
@@ -240,14 +237,25 @@ object McpBuilder {
 
     }
 
-    object SchemaDerivation extends SchemaVisitor.Default[[_] =>> JsonSchema] {
+    object JsonSchema {
+      final case class ObjectSchema(properties: Map[String, JsonSchema], required: List[String])
+        extends JsonSchema
+      final case class AnyOfSchema(options: List[JsonSchema]) extends JsonSchema
+      case object NumberSchema extends JsonSchema
+      case object StringSchema extends JsonSchema
+      final case class ListSchema(itemSchema: JsonSchema) extends JsonSchema
+      final case class EnumSchema(options: List[String]) extends JsonSchema
+      final case class IntEnumSchema(options: List[Int]) extends JsonSchema
+    }
+
+    object SchemaDerivation extends SchemaVisitor.Default[ConstSchema] {
       def default[A]: JsonSchema = ???
 
       override def union[U](
         shapeId: ShapeId,
         hints: Hints,
-        alternatives: Vector[Alt[U, ?]],
-        dispatch: Dispatcher[U],
+        alternatives: Vector[Alt[U, _]],
+        dispatch: Alt.Dispatcher[U],
       ): JsonSchema = JsonSchema.AnyOfSchema(
         alternatives.toList.map(alt => alt.schema.compile(this))
       )
@@ -291,7 +299,7 @@ object McpBuilder {
       override def struct[S](
         shapeId: ShapeId,
         hints: Hints,
-        fields: Vector[Field[S, ?]],
+        fields: Vector[Field[S, _]],
         make: IndexedSeq[Any] => S,
       ): JsonSchema = JsonSchema.ObjectSchema(
         properties = fields.map(f => f.label -> f.schema.compile(this)).toMap,
@@ -300,12 +308,14 @@ object McpBuilder {
 
     }
 
-    def deriveSchema[A: Schema]: ToolSchema =
-      Schema[A].compile(SchemaDerivation) match {
+    def deriveSchema[A](implicit schema: Schema[A]): ToolSchema =
+      schema.compile(SchemaDerivation) match {
         case JsonSchema.ObjectSchema(properties, required) =>
           ToolSchema(
             _type = "object",
-            properties = Some(Document.obj(properties.map(_ -> _.asDocument).toSeq)),
+            properties = Some(
+              Document.obj(properties.map { case (k, v) => k -> v.asDocument }.toSeq)
+            ),
             required = Some(required),
           )
         case _ => sys.error("Only object schemas are supported on the top level")
@@ -316,7 +326,7 @@ object McpBuilder {
   def remoteServerStub[Alg[_[_, _, _, _, _]]](
     service: Service[Alg]
   )(
-    using rawServer: McpServerApi[IO]
+    implicit rawServer: McpServerApi[IO]
   ): service.Impl[IO] = service.impl {
     new service.FunctorEndpointCompiler[IO] {
       def apply[I, E, O, SI, SO](e: service.Endpoint[I, E, O, SI, SO]): I => IO[O] = {
@@ -335,36 +345,32 @@ object McpBuilder {
         i =>
           rawServer
             .callTool(name = toolName(toolHint, e), arguments = inputEncoder.encode(i).some)
-            .flatMap {
-              case CallToolResult(structuredContent = Some(content)) =>
-                content
-                  .decode(
-                    using resultDecoder
-                  )
-                  .liftTo[IO]
+            .flatMap { result =>
+              result.structuredContent match {
+                case Some(content) => resultDecoder.decode(content).liftTo[IO]
 
-              // Best-effort JSON decoding from unstructured content.
-              // The github MCP doesn't use structured responses, for example, so we shouldn't be typing them
-              // but I figured for the example's sake there's no reason not to at least try.
-              case CallToolResult(content = content) =>
+                // Best-effort JSON decoding from unstructured content.
+                // The github MCP doesn't use structured responses, for example, so we shouldn't be typing them
+                // but I figured for the example's sake there's no reason not to at least try.
+                case None =>
+                  val docs = result
+                    .content
+                    .map {
+                      case TextCase(text) => text.text
+                      case other          =>
+                        sys.error(
+                          s"Only text content blocks are supported in this context. Got ${ContentBlock.schema.asInstanceOf[UnionSchema[_]].alternatives(other.$ordinal).label}."
+                        )
+                    }
+                    .map { text =>
+                      smithy4s.json.Json.readDocument(text).getOrElse(Document.fromString(text))
+                    }
 
-                val docs = content
-                  .map {
-                    case TextCase(text) => text.text
-                    case other          =>
-                      sys.error(
-                        s"Only text content blocks are supported in this context. Got ${ContentBlock.schema.asInstanceOf[UnionSchema[?]].alternatives(other.$ordinal).label}."
-                      )
+                  docs match {
+                    case one :: Nil => resultDecoder.decode(one).liftTo[IO]
+                    case _          => resultDecoder.decode(Document.array(docs)).liftTo[IO]
                   }
-                  .map { text =>
-                    smithy4s.json.Json.readDocument(text).getOrElse(Document.fromString(text))
-                  }
-
-                docs match {
-                  case one :: Nil => resultDecoder.decode(one).liftTo[IO]
-                  case _          => resultDecoder.decode(Document.array(docs)).liftTo[IO]
-                }
-
+              }
             }
       }
     }
@@ -375,56 +381,51 @@ object McpBuilder {
 
     def apply[A0](fa: Schema[A0]): Schema[A0] =
       fa match {
-        case struct: StructSchema[b] =>
+        case s: StructSchema[_] =>
+          val struct = s.asInstanceOf[StructSchema[A0]]
+
           struct
             .fields
-            .collectFirst {
-              case field if field.hints.has[JsonRpcPayload] =>
-                field.schema.biject[b]((f: Any) => struct.make(Vector(f)))(field.get)
-            }
+            .collectFirst { case field if field.hints.has[JsonRpcPayload] => field }
+            .map(field => payloadBijection(struct, field.asInstanceOf[Field[A0, Any]]))
             .getOrElse(fa)
+
         case _ => fa
       }
 
+    private def payloadBijection[S](struct: StructSchema[S], field: Field[S, Any]): Schema[S] =
+      field.schema.biject[S]((a: Any) => struct.make(Vector(a)))(field.get)
+
   }
 
-  private def toolName[Op[_, _, _, _, _]](toolHint: McpTool, e: Endpoint[Op, ?, ?, ?, ?, ?])
+  private def toolName[Op[_, _, _, _, _]](toolHint: McpTool, e: Endpoint[Op, _, _, _, _, _])
     : String = toolHint.name.getOrElse(e.id.name)
 
   def clientStub[Alg[_[_, _, _, _, _]]](
     service: Service[Alg]
   )(
-    using rawClient: McpClientApi[IO]
+    implicit rawClient: McpClientApi[IO]
   ): service.Impl[IO] = service.impl {
     new service.FunctorEndpointCompiler[IO] {
       def apply[I, E, O, SI, SO](fa: service.Endpoint[I, E, O, SI, SO]): I => IO[O] = {
 
         val messageFinder: Option[I => String] =
           fa.input match {
-            case StructSchema(shapeId, hints, fields, make) =>
-              fields.find(_.label == "message").map { field =>
-                val toDoc = Document.Encoder.fromSchema(field.schema)
-                field
-                  .get
-                  .andThen { a =>
-                    toDoc.encode(a) match {
-                      case Document.DString(s) => s
-                      case _ => sys.error("Expected the 'message' field to be a string")
-                    }
-                  }
-              }
+            case s: StructSchema[_] =>
+              s.asInstanceOf[StructSchema[I]]
+                .fields
+                .find(_.label == "message")
+                .map(field => messageExtractor(field.asInstanceOf[Field[I, Any]]))
 
             case _ => None
           }
 
-        val inputToMessage = messageFinder.getOrElse(
-          Function.const(s"Server is asking (${fa.id.name})")
+        val inputToMessage: I => String = messageFinder.getOrElse(
+          (_: I) => s"Server is asking (${fa.id.name})"
         )
 
         val requestedSchema = {
-          val compiled = deriveSchema(
-            using fa.output
-          )
+          val compiled = deriveSchema(fa.output)
           ElicitFormSchema(
             _type = "object",
             properties = compiled.properties.get,
@@ -444,17 +445,23 @@ object McpBuilder {
                 )
               )
             )
-            .flatMap(
-              _.content
-                .get
-                .decode(
-                  using resultDecoder
-                )
-                .liftTo[IO]
-            )
+            .flatMap(result => resultDecoder.decode(result.content.get).liftTo[IO])
         }
       }
     }
+  }
+
+  private def messageExtractor[S, A](field: Field[S, A]): S => String = {
+    val toDoc = Document.Encoder.fromSchema(field.schema)
+
+    field
+      .get
+      .andThen { a =>
+        toDoc.encode(a) match {
+          case Document.DString(s) => s
+          case _                   => sys.error("Expected the 'message' field to be a string")
+        }
+      }
   }
 
   def httpClient[Remote[_[_, _, _, _, _]]](
@@ -463,7 +470,7 @@ object McpBuilder {
     baseUrl: Uri,
   ): IO[service.Impl[IO]] = (IO.ref(0L), IO.ref(none[String]))
     .tupled
-    .map { (callIdRef, sessionIdRef) =>
+    .map { case (callIdRef, sessionIdRef) =>
       service.impl(new service.FunctorEndpointCompiler[IO] {
         def apply[I, E, O, SI, SO](fa: service.Endpoint[I, E, O, SI, SO]): I => IO[O] = {
           val encodeIn = CirceJsonCodec.Encoder.fromSchema(fa.input)
@@ -473,7 +480,7 @@ object McpBuilder {
           { in =>
             (callIdRef.getAndUpdate(_ + 1).map(CallId.NumberId(_)), sessionIdRef.get)
               .tupled
-              .flatMap { (callId, sessionIdOpt) =>
+              .flatMap { case (callId, sessionIdOpt) =>
                 rawClient
                   .run(
                     Request[IO](method = Method.POST, uri = baseUrl)
@@ -543,14 +550,11 @@ object McpBuilder {
                       .through(ServerSentEvent.decoder[IO])
                       // .debug("SSE: " + _)
                       .collect {
-                        case ServerSentEvent(
-                              eventType = Some("message"),
-                              data = Some(bodyText),
-                            ) =>
-                          bodyText
+                        case sse if sse.eventType.contains("message") && sse.data.isDefined =>
+                          sse.data.get
                       }
                       .evalMap(decodeResponseMessage)
-                      .collectFirst { case rm @ ResponseMessage(callId = `callId`) => rm }
+                      .collectFirst { case rm if rm.callId == callId => rm }
                       .compile
                       .toList
                       .map(_.head)
@@ -565,9 +569,9 @@ object McpBuilder {
                       .headers
                       .get(CIString("mcp-session-id"))
                       .map(_.head.value)
-                      .traverseVoid(_.some.pipe(sessionIdRef.set)) *>
+                      .traverse_(sid => sessionIdRef.set(Some(sid))) *>
                       {
-                        if isStream then handleStream
+                        if (isStream) handleStream
                         else
                           handleJson
                       }
@@ -586,28 +590,28 @@ object McpBuilder {
 
 object interop {
 
-  def startServer(srv: McpClientApi[IO] ?=> McpServerApi[IO]): Resource[IO, McpClientApi[IO]] =
-    startGen(srv, fs2.io.stdin[IO](512), fs2.io.stdout[IO])
+  // Scala 2 cannot infer `Remote` from the argument type of the `srv` function, so both
+  // algebras are named explicitly here.
+  def startServer(srv: McpClientApi[IO] => McpServerApi[IO]): Resource[IO, McpClientApi[IO]] =
+    startGen[McpServerApiGen, McpClientApiGen](srv, fs2.io.stdin[IO](512), fs2.io.stdout[IO])
 
-  def startClient(c: McpServerApi[IO] ?=> McpClientApi[IO], process: fs2.io.process.Process[IO])
-    : Resource[IO, McpServerApi[IO]] = startGen(c, process.stdout, process.stdin)
+  def startClient(c: McpServerApi[IO] => McpClientApi[IO], process: fs2.io.process.Process[IO])
+    : Resource[IO, McpServerApi[IO]] =
+    startGen[McpClientApiGen, McpServerApiGen](c, process.stdout, process.stdin)
 
   def startGen[Local[_[_, _, _, _, _]], Remote[_[_, _, _, _, _]]](
-    srv: FunctorAlgebra[Remote, IO] ?=> FunctorAlgebra[Local, IO],
+    srv: FunctorAlgebra[Remote, IO] => FunctorAlgebra[Local, IO],
     input: fs2.Stream[IO, Byte],
     output: fs2.Pipe[IO, Byte, Nothing],
   )(
-    using Local: Service[Local],
-    Remote: Service[Remote],
-  ): Resource[IO, Remote.Impl[IO]] = FS2Channel
+    implicit localService: Service[Local],
+    remoteService: Service[Remote],
+  ): Resource[IO, FunctorAlgebra[Remote, IO]] = FS2Channel
     .resource[IO](cancelTemplate = Some(cancelEndpoint))
     .flatMap { channel =>
-      ClientStub(Remote, channel).liftTo[IO].toResource.flatMap { client =>
-        ServerEndpoints(
-          srv(
-            using client
-          )
-        ).liftTo[IO]
+      ClientStub(remoteService, channel).liftTo[IO].toResource.flatMap { client =>
+        ServerEndpoints(srv(client))
+          .liftTo[IO]
           .toResource
           .flatMap { se =>
             channel.withEndpoints(se)
@@ -628,9 +632,9 @@ object interop {
                       .map(e => ProtocolError.ParseError(e.getMessage))
                       .map {
                         // workaround for some clients (like Claude Code) sending requests/notifications with no body.
-                        case rm @ RequestMessage(params = None) =>
+                        case rm: RequestMessage if rm.params.isEmpty =>
                           rm.copy(params = Some(Payload(Json.obj())))
-                        case nm @ NotificationMessage(params = None) =>
+                        case nm: NotificationMessage if nm.params.isEmpty =>
                           nm.copy(params = Some(Payload(Json.obj())))
                         case other => other
                       }
@@ -677,11 +681,3 @@ object interop {
     _.map(Encoder[Message].apply(_).noSpaces + "\n").through(fs2.text.utf8.encode[IO])
 
 }
-
-def printErr(s: String): IO[Unit] = IO.consoleForIO.errorln(s)
-
-// *> Files[IO]
-//   .writeAll(fs2.io.file.Path("debug.log"))
-//   .apply(fs2.Stream.emit(s + "\n").through(fs2.text.utf8.encode))
-//   .compile
-//   .drain

@@ -3,7 +3,7 @@ package app
 import cats.effect.ExitCode
 import cats.effect.IO
 import cats.effect.IOApp
-import cats.syntax.all.*
+import cats.syntax.all._
 import mcptraits.McpServerApi
 import modelcontextprotocol.ClientCapabilities
 import modelcontextprotocol.Implementation
@@ -24,9 +24,10 @@ object clientMainHttp extends IOApp {
           McpBuilder.httpClient(McpServerApi, httpClient, Uri.unsafeFromString(args(0)))
         }
         .onFinalize(printErr("Terminating client"))
-        .use { case given McpServerApi[IO] =>
+        .use { rawServer =>
+          implicit val server: McpServerApi[IO] = rawServer
 
-          McpServerApi[IO]
+          server
             .initialize(
               protocolVersion = "2025-11-25",
               capabilities = ClientCapabilities(),
@@ -36,7 +37,7 @@ object clientMainHttp extends IOApp {
               printErr(
                 s"Initialized with: ${initResult.serverInfo.name} ${initResult.serverInfo.version}"
               ) *>
-                McpServerApi[IO].listTools().flatMap { tools =>
+                server.listTools().flatMap { tools =>
                   printErr(s"Available tools: ${tools.tools.map(_.name).mkString(", ")}")
                 } *>
                 useGithub(McpBuilder.remoteServerStub(GithubMcpServer))

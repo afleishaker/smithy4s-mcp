@@ -2,9 +2,14 @@ package app
 
 import cats.effect.IO
 import cats.effect.IOApp
+import mcptraits.McpServerApi
+import modelcontextprotocol.CallToolResult
 import modelcontextprotocol.ClientCapabilities
+import modelcontextprotocol.Cursor
 import modelcontextprotocol.Implementation
 import modelcontextprotocol.InitializeResult
+import modelcontextprotocol.ListToolsResult
+import modelcontextprotocol.TaskMetadata
 import my.server.AdderOutput
 import my.server.AskNameOutput
 import my.server.Character
@@ -22,16 +27,16 @@ object main extends IOApp.Simple {
     def myTools(
       getClientCapabilities: IO[ClientCapabilities]
     )(
-      using client: MyClient[IO]
+      implicit client: MyClient[IO]
     ): MyServer[IO] =
-      new {
+      new MyServer[IO] {
         def adder(a: Int, b: Option[Int]): IO[AdderOutput] =
           for {
             clientCaps <- getClientCapabilities
             _ <- printErr(s"Caps: $clientCaps")
             name <-
-              if clientCaps.elicitation.isDefined
-              then client.askName("say my name")
+              if (clientCaps.elicitation.isDefined)
+                client.askName("say my name")
               else
                 IO.pure(AskNameOutput("default"))
             _ <- printErr(s"Hello, $name! Adding $a and ${b.getOrElse(0)}")
@@ -56,15 +61,27 @@ object main extends IOApp.Simple {
     printErr("Starting server") *>
       IO.ref(Option.empty[ClientCapabilities]).flatMap { clientCaps =>
         interop
-          .startServer {
+          .startServer { rawClient =>
             val impl = McpBuilder.server(
               myTools(clientCaps.get.map(_.getOrElse(ClientCapabilities())))(
-                using McpBuilder.clientStub(MyClient)
+                McpBuilder.clientStub(MyClient)(rawClient)
               )
             )
 
-            new {
-              export impl.{initialize as _, *}
+            // Scala 2 has no `export`, so the three untouched operations are delegated by hand
+            // and only `initialize` adds behaviour on top of the derived implementation.
+            new McpServerApi[IO] {
+              def ping(): IO[Unit] = impl.ping()
+
+              def listTools(cursor: Option[Cursor], _meta: Option[Map[String, Document]])
+                : IO[ListToolsResult] = impl.listTools(cursor, _meta)
+
+              def callTool(
+                name: String,
+                arguments: Option[Document],
+                task: Option[TaskMetadata],
+                _meta: Option[Map[String, Document]],
+              ): IO[CallToolResult] = impl.callTool(name, arguments, task, _meta)
 
               def initialize(
                 protocolVersion: String,

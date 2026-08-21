@@ -2,7 +2,7 @@
     "version" : "1.0",
     "sources" : [
         "models/src/main/smithy",
-        "models/target/scala-3.8.1/src_managed/main/smithy"
+        "models/target/scala-2.13/src_managed/main/smithy"
     ],
     "maven" : {
         "dependencies" : [
